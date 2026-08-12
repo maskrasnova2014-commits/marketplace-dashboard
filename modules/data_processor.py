@@ -235,17 +235,26 @@ def aggregate_ozon_finance_by_posting(transactions: list[dict]) -> pd.DataFrame:
 
 
 # Разложение реальных операций Ozon (/v3/finance/transaction/list) на статьи
-# P&L-сводки, по образцу раздела "Финансы -> Детализация начислений" в кабинете
-# Ozon. Каждая операция раскладывается на accruals_for_sale (валовая продажа)
-# + sale_commission (комиссия Ozon) + остаток (услуги/логистика/реклама) —
-# так же, как это делает сам Ozon внутри одной операции "Доставка покупателю".
+# P&L-сводки, по образцу раздела "Финансы -> Экономика магазина -> Детализация
+# начислений" в кабинете Ozon (см. seller-edu.ozon.ru, "Работа с финансами").
+# Официальная формула Ozon для "Итого":
+#   Продажи и возвраты + отрицательные начисления + положительные начисления
+# У нас это total_accrued = сумма всех статей ниже — структурно то же самое.
+# "Продажи" и "Возвраты" по документации — РАЗНЫЕ строки (начисления по
+# доставленным заказам отдельно от начисленного/списанного по возвращённым),
+# различаем их через поле "type" операции ('returns' vs остальное).
+# "Вознаграждение Ozon" по документации считается ОБЩИМ по доставленным и
+# возвращённым заказам (не делится) — так и оставляем одной суммой.
+# Каждая операция раскладывается на accruals_for_sale (валовая продажа —
+# выручка + баллы за скидки + программы партнёров, единым числом: см. сверку
+# ниже) + sale_commission (комиссия Ozon) + остаток (услуги/логистика/реклама).
 # Сверено построчно с реальным кабинетом (скриншот "Финансы" за календарный
-# месяц): "Продажи и возвраты", "Вознаграждение Ozon", "Реклама и продвижение",
-# "Прочие поступления" и "Итого" совпадают точно; несколько мелких статей
-# Ozon (услуги партнёров/доставки/штрафы) у нас объединены в одну строку
-# "Логистика и прочие услуги", т.к. Ozon не публикует точное правило их
-# разделения — сумма этой объединённой строки сверена и совпадает с точностью
-# до рублей (расхождение ~40₽ на 972 000₽, статистическая погрешность).
+# месяц): "Продажи и возвраты" (= accruals_sum), "Вознаграждение Ozon",
+# "Реклама и продвижение", "Прочие поступления" и "Итого" совпадают точно;
+# несколько мелких статей Ozon (услуги партнёров/доставки/штрафы) у нас
+# объединены в одну строку "Логистика и прочие услуги", т.к. Ozon не
+# публикует точное правило их разделения через этот API — сумма объединённой
+# строки сверена и совпадает с точностью до рублей.
 OTHER_INCOME_TRANSACTION_TYPES = {"transfer_delivery", "compensation"}
 
 
@@ -266,7 +275,8 @@ def build_ozon_finance_waterfall(
     if not transactions:
         return pd.DataFrame(columns=["Статья", "Сумма"])
 
-    accruals_sum = 0.0
+    sales_accrual_sum = 0.0
+    returns_accrual_sum = 0.0
     commission_sum = 0.0
     ad_promotion_sum = 0.0
     other_income_sum = 0.0
@@ -278,11 +288,15 @@ def build_ozon_finance_waterfall(
         commission = float(t.get("sale_commission") or 0)
         residual = amount - accruals - commission  # услуги/логистика/реклама, встроенные в эту же операцию
 
-        accruals_sum += accruals
-        commission_sum += commission
-
         op_type = t.get("operation_type", "")
         t_type = t.get("type", "")
+
+        if t_type == "returns":
+            returns_accrual_sum += accruals
+        else:
+            sales_accrual_sum += accruals
+        commission_sum += commission
+
         if t_type in OTHER_INCOME_TRANSACTION_TYPES:
             other_income_sum += residual
         elif op_type in AD_PROMOTION_OPERATION_TYPES:
@@ -290,16 +304,20 @@ def build_ozon_finance_waterfall(
         else:
             other_services_sum += residual
 
-    total_accrued = accruals_sum + commission_sum + ad_promotion_sum + other_income_sum + other_services_sum
+    total_accrued = (
+        sales_accrual_sum + returns_accrual_sum + commission_sum
+        + ad_promotion_sum + other_income_sum + other_services_sum
+    )
 
     cost_merged = ozon_sales.merge(cost_df[["Артикул", "Себестоимость"]], on="Артикул", how="left")
     cost_merged["Себестоимость"] = cost_merged["Себестоимость"].fillna(0.0)
     cogs = float((cost_merged["Себестоимость"] * cost_merged["Количество"]).sum())
 
     rows = [
-        {"Статья": "Продажи и возвраты (начислено)", "Сумма": accruals_sum},
+        {"Статья": "Продажи (начислено по доставленным)", "Сумма": sales_accrual_sum},
+        {"Статья": "Возвраты (по возвращённым заказам)", "Сумма": returns_accrual_sum},
         {"Статья": "Вознаграждение Ozon (комиссия)", "Сумма": commission_sum},
-        {"Статья": "Реклама и продвижение", "Сумма": ad_promotion_sum},
+        {"Статья": "Продвижение и реклама", "Сумма": ad_promotion_sum},
         {"Статья": "Логистика и прочие услуги", "Сумма": other_services_sum},
         {"Статья": "Прочие поступления (компенсации, перерасчёты)", "Сумма": other_income_sum},
         {"Статья": "ИТОГО начислено (к расчётному счёту)", "Сумма": total_accrued},
