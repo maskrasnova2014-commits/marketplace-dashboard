@@ -2,22 +2,27 @@
 Клиент для работы с API Ozon Seller.
 
 Используемые методы:
-- POST /v2/posting/fbo/list        — список отправлений FBO (склад Ozon)
-- POST /v3/posting/fbs/list        — список отправлений FBS (склад продавца)
-- POST /v1/finance/realization     — отчёт о реализации (факт продаж, комиссии)
+- POST /v2/posting/fbo/list           — список отправлений FBO (склад Ozon)
+- POST /v3/posting/fbs/list           — список отправлений FBS (склад продавца)
+- POST /v3/finance/transaction/list   — реальные начисления по отправлениям:
+                                         комиссия, логистика, прочие услуги
+                                         (используется вместо /v1/finance/realization,
+                                         который на практике возвращает 404 — видимо,
+                                         устарел в текущей версии API)
 
 Документация: https://docs.ozon.ru/api/seller/
 """
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 import requests
 
 BASE_URL = "https://api-seller.ozon.ru"
 TIMEOUT = 15
+MAX_TRANSACTION_PERIOD_DAYS = 30  # реальное ограничение Ozon: "too long period, only one month allowed"
 
 
 class OzonAPIError(Exception):
@@ -86,8 +91,47 @@ class OzonClient:
         data = self._post("/v3/posting/fbs/list", payload)
         return data.get("result", {}).get("postings", [])
 
-    def get_realization_report(self, year: int, month: int) -> list[dict[str, Any]]:
-        """Отчёт о реализации товаров (факт продаж и комиссии) за месяц."""
-        payload = {"year": year, "month": month}
-        data = self._post("/v1/finance/realization", payload)
-        return data.get("result", {}).get("rows", [])
+    def _get_finance_transactions_chunk(self, date_from: date, date_to: date) -> list[dict[str, Any]]:
+        """Пагинированный запрос за период не длиннее месяца (см. get_finance_transactions)."""
+        operations: list[dict[str, Any]] = []
+        page = 1
+        page_size = 1000
+        while True:
+            payload = {
+                "filter": {
+                    "date": {
+                        "from": f"{date_from.isoformat()}T00:00:00.000Z",
+                        "to": f"{date_to.isoformat()}T23:59:59.999Z",
+                    },
+                    "operation_type": [],
+                    "posting_number": "",
+                    "transaction_type": "all",
+                },
+                "page": page,
+                "page_size": page_size,
+            }
+            data = self._post("/v3/finance/transaction/list", payload)
+            result = data.get("result", {})
+            batch = result.get("operations", [])
+            operations.extend(batch)
+            if len(batch) < page_size or page >= result.get("page_count", page):
+                break
+            page += 1
+        return operations
+
+    def get_finance_transactions(self, date_from: date, date_to: date) -> list[dict[str, Any]]:
+        """
+        Реальные финансовые операции по отправлениям за период: комиссия
+        (sale_commission), логистика и прочие услуги (services[]) по каждому
+        posting_number. Пагинируется автоматически (до 1000 строк за раз).
+
+        Ozon ограничивает период одним месяцем ("too long period, only one
+        month allowed") — более длинные периоды разбиваются на куски по 30 дней.
+        """
+        operations: list[dict[str, Any]] = []
+        chunk_start = date_from
+        while chunk_start <= date_to:
+            chunk_end = min(chunk_start + timedelta(days=MAX_TRANSACTION_PERIOD_DAYS - 1), date_to)
+            operations.extend(self._get_finance_transactions_chunk(chunk_start, chunk_end))
+            chunk_start = chunk_end + timedelta(days=1)
+        return operations

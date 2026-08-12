@@ -65,6 +65,7 @@ def transform_ozon_postings(postings: list[dict], seller_label: str) -> pd.DataF
                     "Сумма": round(price * qty, 2),
                     "Статус": status,
                     "Причина_отмены": "Отмена (см. Ozon Seller)" if status == "Отменён" else None,
+                    "Отправление": posting.get("posting_number", ""),
                 }
             )
     df = pd.DataFrame(rows)
@@ -93,6 +94,7 @@ def transform_wb_sales(sales: list[dict], seller_label: str) -> pd.DataFrame:
                 "Сумма": round(price, 2),
                 "Статус": status,
                 "Причина_отмены": "Возврат покупателем" if is_return else None,
+                "Отправление": None,
             }
         )
     df = pd.DataFrame(rows)
@@ -169,6 +171,40 @@ def transform_wb_ads(advert_costs: list[dict], seller_label: str) -> pd.DataFram
         df = df.dropna(subset=["Дата"])
         df["Месяц"] = df["Дата"].dt.to_period("M").astype(str)
     return df
+
+
+def aggregate_ozon_finance_by_posting(transactions: list[dict]) -> pd.DataFrame:
+    """
+    Сворачивает операции /v3/finance/transaction/list в реальную комиссию и
+    логистику по каждому posting_number.
+
+    Проверено на реальных данных: sale_commission — комиссия маркетплейса
+    (уже отрицательная в ответе). services[] — построчные услуги (курьер
+    последней мили, магистраль, эквайринг и т.п.); delivery_charge/
+    return_delivery_charge — доп. поля логистики у некоторых типов операций.
+    Суммируется по всем операциям за период для каждого отправления —
+    комиссия и разные логистические начисления по одному заказу могут
+    приходить отдельными операциями.
+    """
+    totals: dict[str, dict[str, float]] = {}
+    for op in transactions:
+        posting_number = (op.get("posting") or {}).get("posting_number")
+        if not posting_number:
+            continue
+        commission = -(op.get("sale_commission") or 0)
+        services_cost = -sum(s.get("price", 0) for s in (op.get("services") or []))
+        delivery_cost = -((op.get("delivery_charge") or 0) + (op.get("return_delivery_charge") or 0))
+
+        entry = totals.setdefault(posting_number, {"Комиссия_реальная": 0.0, "Логистика_реальная": 0.0})
+        entry["Комиссия_реальная"] += commission
+        entry["Логистика_реальная"] += services_cost + delivery_cost
+
+    if not totals:
+        return pd.DataFrame(columns=["Отправление", "Комиссия_реальная", "Логистика_реальная"])
+
+    return pd.DataFrame(
+        [{"Отправление": k, **v} for k, v in totals.items()]
+    )
 
 
 def filter_orders(
@@ -297,14 +333,53 @@ def calculate_unit_economics(
     orders: pd.DataFrame,
     cost_df: pd.DataFrame,
     ads: pd.DataFrame,
+    ozon_finance_by_posting: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Считает юнит-экономику по каждому артикулу: от выручки до чистой прибыли.
 
     Складывается из:
       Выручка - Себестоимость - Комиссия МП - Логистика - Реклама (ДРР на ед.)
+
+    Комиссия и логистика берутся из реального финансового отчёта Ozon
+    (ozon_finance_by_posting, см. aggregate_ozon_finance_by_posting), если он
+    передан — построчно, с распределением суммы отправления между товарами
+    пропорционально их доле в сумме отправления. Для строк без реального
+    совпадения (WB, ещё не сведённые Ozon-отправления, mock-данные) — плоская
+    оценка по ставкам из mock_data (COMMISSION_RATES/LOGISTICS_*).
     """
     sales = orders[orders["Статус"] != "Отменён"].copy()
+
+    flat_commission = sales.apply(
+        lambda r: r["Сумма"] * COMMISSION_RATES.get(r["Маркетплейс"], 0.18), axis=1
+    )
+    flat_logistics = sales.apply(
+        lambda r: (
+            LOGISTICS_MAGISTRAL.get(r["Маркетплейс"], 300) + LOGISTICS_LAST_MILE.get(r["Маркетплейс"], 200)
+        )
+        * r["Количество"],
+        axis=1,
+    )
+
+    has_real_ozon_data = (
+        ozon_finance_by_posting is not None
+        and not ozon_finance_by_posting.empty
+        and "Отправление" in sales.columns
+    )
+    if has_real_ozon_data:
+        posting_totals = sales.groupby("Отправление")["Сумма"].transform("sum")
+        row_share = (sales["Сумма"] / posting_totals.replace(0, pd.NA)).fillna(1.0)
+        real = sales[["Отправление"]].merge(ozon_finance_by_posting, on="Отправление", how="left")
+
+        sales["Комиссия МП"] = (real["Комиссия_реальная"] * row_share).where(
+            real["Комиссия_реальная"].notna(), flat_commission
+        )
+        sales["Логистика"] = (real["Логистика_реальная"] * row_share).where(
+            real["Логистика_реальная"].notna(), flat_logistics
+        )
+    else:
+        sales["Комиссия МП"] = flat_commission
+        sales["Логистика"] = flat_logistics
 
     per_sku = (
         sales.groupby(["Артикул", "Категория", "Селлер", "Маркетплейс"], as_index=False)
@@ -312,24 +387,14 @@ def calculate_unit_economics(
             **{
                 "Продано (шт)": ("Количество", "sum"),
                 "Выручка": ("Сумма", "sum"),
+                "Комиссия МП": ("Комиссия МП", "sum"),
+                "Логистика": ("Логистика", "sum"),
             }
         )
     )
     per_sku = per_sku.merge(cost_df[["Артикул", "Себестоимость"]], on="Артикул", how="left")
     per_sku["Себестоимость"] = per_sku["Себестоимость"].fillna(0.0)
     per_sku["Себестоимость (итого)"] = per_sku["Себестоимость"] * per_sku["Продано (шт)"]
-
-    per_sku["Комиссия МП"] = per_sku.apply(
-        lambda r: r["Выручка"] * COMMISSION_RATES.get(r["Маркетплейс"], 0.18), axis=1
-    )
-    per_sku["Логистика"] = per_sku.apply(
-        lambda r: (
-            LOGISTICS_MAGISTRAL.get(r["Маркетплейс"], 300)
-            + LOGISTICS_LAST_MILE.get(r["Маркетплейс"], 200)
-        )
-        * r["Продано (шт)"],
-        axis=1,
-    )
 
     ad_by_mp = ads.groupby("Маркетплейс", as_index=False).agg(
         **{"Расходы_на_рекламу": ("Расходы_на_рекламу", "sum"), "Выручка_с_рекламы": ("Выручка_с_рекламы", "sum")}

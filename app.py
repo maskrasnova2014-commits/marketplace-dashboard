@@ -172,6 +172,14 @@ def _fetch_wb_ads_raw(api_token: str, seller_label: str, date_from: date, date_t
     return dp.transform_wb_ads(costs, seller_label)
 
 
+@st.cache_data(ttl=3600, show_spinner="Загрузка финансовых данных Ozon...")
+def _fetch_ozon_finance_raw(client_id: str, api_key: str, date_from: date, date_to: date):
+    """Реальная комиссия/логистика по отправлениям Ozon (для юнит-экономики)."""
+    client = OzonClient(client_id, api_key)
+    transactions = client.get_finance_transactions(date_from, date_to)
+    return dp.aggregate_ozon_finance_by_posting(transactions)
+
+
 def _fetch_with_cooldown(source_key: str, fetch_fn, error_types, label: str):
     """
     Тонкая (не кэшируемая) обвязка: ловит ошибки API и не даёт им "залипать"
@@ -246,6 +254,15 @@ def fetch_wb_ads(api_token: str, seller_label: str, date_from: date, date_to: da
         lambda: _fetch_wb_ads_raw(api_token, seller_label, date_from, date_to),
         WBAPIError,
         "Wildberries Advert",
+    )
+
+
+def fetch_ozon_finance(client_id: str, api_key: str, seller_label: str, date_from: date, date_to: date):
+    return _fetch_with_cooldown(
+        f"ozon_finance_{client_id}",
+        lambda: _fetch_ozon_finance_raw(client_id, api_key, date_from, date_to),
+        OzonAPIError,
+        f"Ozon Finance ({seller_label})",
     )
 
 
@@ -346,6 +363,29 @@ def load_ads(date_from: date, date_to: date) -> pd.DataFrame:
         st.info(f"Реклама: тестовые данные используются для — {missing} (нет ключа рекламного API или ошибка).")
 
     return pd.concat(frames, ignore_index=True)
+
+
+def load_ozon_finance(date_from: date, date_to: date) -> pd.DataFrame | None:
+    """
+    Реальная комиссия и логистика по отправлениям Ozon (/v3/finance/transaction/list),
+    по всем настроенным кабинетам сразу. Возвращает None, если ни один кабинет не
+    настроен или данные недоступны — тогда юнит-экономика использует плоскую оценку.
+    """
+    frames = []
+    for account in st.session_state.ozon_accounts:
+        if not (account["client_id"] and account["api_key"]):
+            continue
+        df = fetch_ozon_finance(
+            account["client_id"], account["api_key"], account["seller_label"] or "Ozon-кабинет", date_from, date_to
+        )
+        if df is not None and not df.empty:
+            frames.append(df)
+
+    if not frames:
+        return None
+
+    combined = pd.concat(frames, ignore_index=True)
+    return combined.groupby("Отправление", as_index=False).sum(numeric_only=True)
 
 
 # --------------------------------------------------------------------------
@@ -450,6 +490,7 @@ with st.sidebar:
 # --------------------------------------------------------------------------
 orders_raw, is_mock = load_orders(st.session_state.date_from, st.session_state.date_to)
 ads_raw = load_ads(st.session_state.date_from, st.session_state.date_to)
+ozon_finance_by_posting = load_ozon_finance(st.session_state.date_from, st.session_state.date_to)
 
 all_marketplaces = sorted(orders_raw["Маркетплейс"].unique().tolist())
 all_sellers = sorted(orders_raw["Селлер"].unique().tolist())
@@ -561,7 +602,14 @@ st.divider()
 # 5. Юнит-экономика
 # --------------------------------------------------------------------------
 st.subheader("💰 Юнит-экономика (от выручки к чистой прибыли)")
-unit_econ = dp.calculate_unit_economics(orders, cost_df, ads)
+if ozon_finance_by_posting is not None:
+    st.caption(
+        "✅ Комиссия и логистика Ozon — реальные данные из финансового отчёта "
+        "(/v3/finance/transaction/list) по отправлениям. Для WB и непривязанных строк — оценка по средним ставкам."
+    )
+else:
+    st.caption("⚠️ Комиссия и логистика — оценка по средним ставкам (нет данных Ozon Finance API).")
+unit_econ = dp.calculate_unit_economics(orders, cost_df, ads, ozon_finance_by_posting)
 
 total_profit = unit_econ["Чистая прибыль"].sum()
 total_revenue = unit_econ["Выручка"].sum()
