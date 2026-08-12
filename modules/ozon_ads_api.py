@@ -17,13 +17,14 @@ get_daily_statistics().
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 import requests
 
 ADS_BASE_URL = "https://api-performance.ozon.ru"
 TIMEOUT = 20
+MAX_STATISTICS_PERIOD_DAYS = 62  # реальное ограничение Ozon: {"error":"max statistics period: 62 days"}
 
 
 class OzonAdsAPIError(Exception):
@@ -67,8 +68,7 @@ class OzonAdsClient:
         token = self._token or self._authenticate()
         return {"Authorization": f"Bearer {token}", "Client-Id": self.client_id, "Content-Type": "application/json"}
 
-    def get_daily_statistics(self, date_from: date, date_to: date) -> list[dict[str, Any]]:
-        """Расходы на рекламу по дням (Трафареты / Продвижение товаров)."""
+    def _get_daily_statistics_chunk(self, date_from: date, date_to: date) -> list[dict[str, Any]]:
         try:
             response = requests.get(
                 f"{ADS_BASE_URL}/api/client/statistics/daily/json",
@@ -87,3 +87,18 @@ class OzonAdsClient:
             return data.get("rows") or data.get("result") or []
         except requests.RequestException as exc:
             raise OzonAdsAPIError(f"Сетевая ошибка при запросе статистики Ozon Performance API: {exc}") from exc
+
+    def get_daily_statistics(self, date_from: date, date_to: date) -> list[dict[str, Any]]:
+        """
+        Расходы на рекламу по дням (Трафареты / Продвижение товаров).
+
+        Ozon ограничивает один запрос периодом максимум 62 дня — более
+        длинные периоды разбиваются на куски и запросы делаются по очереди.
+        """
+        rows: list[dict[str, Any]] = []
+        chunk_start = date_from
+        while chunk_start <= date_to:
+            chunk_end = min(chunk_start + timedelta(days=MAX_STATISTICS_PERIOD_DAYS - 1), date_to)
+            rows.extend(self._get_daily_statistics_chunk(chunk_start, chunk_end))
+            chunk_start = chunk_end + timedelta(days=1)
+        return rows
