@@ -174,10 +174,9 @@ def _fetch_wb_ads_raw(api_token: str, seller_label: str, date_from: date, date_t
 
 @st.cache_data(ttl=3600, show_spinner="Загрузка финансовых данных Ozon...")
 def _fetch_ozon_finance_raw(client_id: str, api_key: str, date_from: date, date_to: date):
-    """Реальная комиссия/логистика по отправлениям Ozon (для юнит-экономики)."""
+    """Сырые финансовые операции Ozon за период (используются и для юнит-экономики, и для сводки P&L)."""
     client = OzonClient(client_id, api_key)
-    transactions = client.get_finance_transactions(date_from, date_to)
-    return dp.aggregate_ozon_finance_by_posting(transactions)
+    return client.get_finance_transactions(date_from, date_to)
 
 
 def _fetch_with_cooldown(source_key: str, fetch_fn, error_types, label: str):
@@ -203,10 +202,10 @@ def _fetch_with_cooldown(source_key: str, fetch_fn, error_types, label: str):
         return None
 
     try:
-        df = fetch_fn()
+        result = fetch_fn()
         st.session_state.pop(fail_key, None)
         st.session_state.pop(cooldown_key, None)
-        return df if not df.empty else None
+        return result if len(result) > 0 else None
     except error_types as exc:
         st.session_state[fail_key] = now
         st.session_state[cooldown_key] = getattr(exc, "retry_after_seconds", None) or RETRY_COOLDOWN_SECONDS
@@ -365,27 +364,25 @@ def load_ads(date_from: date, date_to: date) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
-def load_ozon_finance(date_from: date, date_to: date) -> pd.DataFrame | None:
+def load_ozon_finance_transactions(date_from: date, date_to: date) -> list[dict] | None:
     """
-    Реальная комиссия и логистика по отправлениям Ozon (/v3/finance/transaction/list),
-    по всем настроенным кабинетам сразу. Возвращает None, если ни один кабинет не
-    настроен или данные недоступны — тогда юнит-экономика использует плоскую оценку.
+    Сырые финансовые операции Ozon (/v3/finance/transaction/list) по всем
+    настроенным кабинетам сразу. Возвращает None, если ни один кабинет не
+    настроен или данные недоступны — тогда используется плоская оценка.
     """
-    frames = []
+    all_transactions: list[dict] = []
+    got_any = False
     for account in st.session_state.ozon_accounts:
         if not (account["client_id"] and account["api_key"]):
             continue
-        df = fetch_ozon_finance(
+        transactions = fetch_ozon_finance(
             account["client_id"], account["api_key"], account["seller_label"] or "Ozon-кабинет", date_from, date_to
         )
-        if df is not None and not df.empty:
-            frames.append(df)
+        if transactions:
+            all_transactions.extend(transactions)
+            got_any = True
 
-    if not frames:
-        return None
-
-    combined = pd.concat(frames, ignore_index=True)
-    return combined.groupby("Отправление", as_index=False).sum(numeric_only=True)
+    return all_transactions if got_any else None
 
 
 # --------------------------------------------------------------------------
@@ -490,7 +487,12 @@ with st.sidebar:
 # --------------------------------------------------------------------------
 orders_raw, is_mock = load_orders(st.session_state.date_from, st.session_state.date_to)
 ads_raw = load_ads(st.session_state.date_from, st.session_state.date_to)
-ozon_finance_by_posting = load_ozon_finance(st.session_state.date_from, st.session_state.date_to)
+ozon_finance_transactions = load_ozon_finance_transactions(st.session_state.date_from, st.session_state.date_to)
+ozon_finance_by_posting = (
+    dp.aggregate_ozon_finance_by_posting(ozon_finance_transactions)
+    if ozon_finance_transactions is not None
+    else None
+)
 
 all_marketplaces = sorted(orders_raw["Маркетплейс"].unique().tolist())
 all_sellers = sorted(orders_raw["Селлер"].unique().tolist())
@@ -599,7 +601,23 @@ st.dataframe(
 st.divider()
 
 # --------------------------------------------------------------------------
-# 5. Юнит-экономика
+# 5. Финансовая сводка Ozon (по образцу "Финансы -> Экономика магазина")
+# --------------------------------------------------------------------------
+if ozon_finance_transactions:
+    st.subheader("🧾 Финансовая сводка Ozon: от начислений к чистой прибыли")
+    st.caption(
+        "Реальные данные из финансового отчёта Ozon (/v3/finance/transaction/list) — "
+        "то же, что видно в кабинете Ozon в разделе «Финансы». «ИТОГО начислено» — "
+        "сумма, которую Ozon фактически должен перечислить на расчётный счёт за период "
+        "(до вычета себестоимости, которую Ozon не знает)."
+    )
+    ozon_sales_for_cogs = orders[(orders["Маркетплейс"] == "Ozon") & (orders["Статус"] != "Отменён")]
+    finance_waterfall = dp.build_ozon_finance_waterfall(ozon_finance_transactions, ozon_sales_for_cogs, cost_df)
+    st.dataframe(with_money_columns(finance_waterfall, ["Сумма"]), use_container_width=True, hide_index=True)
+    st.divider()
+
+# --------------------------------------------------------------------------
+# 6. Юнит-экономика
 # --------------------------------------------------------------------------
 st.subheader("💰 Юнит-экономика (от выручки к чистой прибыли)")
 if ozon_finance_by_posting is not None:

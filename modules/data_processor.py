@@ -207,6 +207,88 @@ def aggregate_ozon_finance_by_posting(transactions: list[dict]) -> pd.DataFrame:
     )
 
 
+# Группировка реальных операций Ozon (/v3/finance/transaction/list) в статьи
+# P&L-сводки, по образцу раздела "Финансы -> Экономика магазина" в кабинете
+# Ozon. Список operation_type собран по факту из ответа реального аккаунта —
+# необязательно исчерпывающий: всё, что не попало в маппинг, уходит в
+# "Прочее (неклассифицировано)" и остаётся видно в детальной таблице, а не
+# теряется молча.
+OZON_FINANCE_CATEGORY_MAP: dict[str, str] = {
+    "OperationAgentDeliveredToCustomer": "Продажи (доставлено покупателям)",
+    "ClientReturnAgentOperation": "Возвраты, отмены, невыкупы",
+    "OperationReturnGoodsFBSofRMS": "Возвраты, отмены, невыкупы",
+    "OperationItemReturn": "Возвраты, отмены, невыкупы",
+    "MarketplaceServiceRedistributionOfDeliveryServicesRFBS": "Логистика и доставка",
+    "MarketplaceAgencyFeeAggregator3plRFBS": "Логистика и доставка",
+    "MarketplaceSellerReexposureDeliveryReturnOperation": "Логистика и доставка",
+    "OperationMarketplaceCostPerClick": "Реклама и продвижение (основной кабинет)",
+    "MarketplaceServiceBrandCommission": "Реклама и продвижение (основной кабинет)",
+    "OperationPromotionWithCostPerOrder": "Реклама и продвижение (основной кабинет)",
+    "OperationSubscriptionPremiumPlus": "Реклама и продвижение (основной кабинет)",
+    "OperationMarketplaceAcceleratedProductReviews": "Реклама и продвижение (основной кабинет)",
+    "OperationLabelOriginal": "Прочие услуги Ozon",
+    "OperationLabelBrandVerified": "Прочие услуги Ozon",
+    "MarketplaceRedistributionOfAcquiringOperation": "Прочие услуги Ozon",
+    "InsuranceServiceSellerItem": "Прочие услуги Ozon",
+    "OperationMarketplaceServiceVolumeWeightCharacsProcessing": "Прочие услуги Ozon",
+    "OperationMarketplaceItemTemporaryStorageRedistribution": "Прочие услуги Ozon",
+    "DefectFineCancellation": "Штрафы и корректировки",
+    "DefectFineCancellationCancelled": "Штрафы и корректировки",
+    "AccrualWithoutDocs": "Компенсации",
+}
+FINANCE_ROW_ORDER = [
+    "Продажи (доставлено покупателям)",
+    "Возвраты, отмены, невыкупы",
+    "Логистика и доставка",
+    "Реклама и продвижение (основной кабинет)",
+    "Прочие услуги Ozon",
+    "Штрафы и корректировки",
+    "Компенсации",
+    "Прочее (неклассифицировано)",
+]
+
+
+def build_ozon_finance_waterfall(
+    transactions: list[dict],
+    ozon_sales: pd.DataFrame,
+    cost_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    P&L-сводка по реальным операциям Ozon: от начислений по статьям до
+    суммы, реально причитающейся к перечислению на расчётный счёт
+    ("ИТОГО начислено"), и дальше — до чистой прибыли после себестоимости.
+
+    ozon_sales — заказы Ozon (не отменённые), используются только для
+    расчёта себестоимости проданного за период; сама выручка/комиссия/
+    логистика берутся из транзакций, а не из заказов.
+    """
+    if not transactions:
+        return pd.DataFrame(columns=["Статья", "Сумма"])
+
+    tx_df = pd.DataFrame(transactions)
+    tx_df["amount"] = tx_df["amount"].astype(float)
+    tx_df["Статья"] = tx_df["operation_type"].map(OZON_FINANCE_CATEGORY_MAP).fillna("Прочее (неклассифицировано)")
+
+    by_category = tx_df.groupby("Статья", as_index=False)["amount"].sum().rename(columns={"amount": "Сумма"})
+    by_category["_order"] = by_category["Статья"].apply(
+        lambda c: FINANCE_ROW_ORDER.index(c) if c in FINANCE_ROW_ORDER else len(FINANCE_ROW_ORDER)
+    )
+    by_category = by_category.sort_values("_order").drop(columns="_order")
+
+    total_accrued = float(tx_df["amount"].sum())
+
+    cost_merged = ozon_sales.merge(cost_df[["Артикул", "Себестоимость"]], on="Артикул", how="left")
+    cost_merged["Себестоимость"] = cost_merged["Себестоимость"].fillna(0.0)
+    cogs = float((cost_merged["Себестоимость"] * cost_merged["Количество"]).sum())
+
+    rows = by_category.to_dict("records")
+    rows.append({"Статья": "ИТОГО начислено (к расчётному счёту)", "Сумма": total_accrued})
+    rows.append({"Статья": "Себестоимость проданных товаров", "Сумма": -cogs})
+    rows.append({"Статья": "Чистая прибыль (после себестоимости)", "Сумма": total_accrued - cogs})
+
+    return pd.DataFrame(rows)
+
+
 def filter_orders(
     orders: pd.DataFrame,
     marketplaces: list[str] | None = None,
