@@ -462,7 +462,7 @@ def calculate_unit_economics(
     совпадения (WB, ещё не сведённые Ozon-отправления, mock-данные) — плоская
     оценка по ставкам из mock_data (COMMISSION_RATES/LOGISTICS_*).
     """
-    sales = orders[orders["Статус"] != "Отменён"].copy()
+    sales = orders[orders["Статус"] != "Отменён"].reset_index(drop=True).copy()
 
     flat_commission = sales.apply(
         lambda r: r["Сумма"] * COMMISSION_RATES.get(r["Маркетплейс"], 0.18), axis=1
