@@ -195,13 +195,15 @@ def aggregate_ozon_finance_by_posting(transactions: list[dict]) -> pd.DataFrame:
     Сворачивает операции /v3/finance/transaction/list в реальную комиссию и
     логистику по каждому posting_number.
 
-    Проверено на реальных данных: sale_commission — комиссия маркетплейса
-    (уже отрицательная в ответе). services[] — построчные услуги (курьер
-    последней мили, магистраль, эквайринг и т.п.); delivery_charge/
-    return_delivery_charge — доп. поля логистики у некоторых типов операций.
-    Суммируется по всем операциям за период для каждого отправления —
-    комиссия и разные логистические начисления по одному заказу могут
-    приходить отдельными операциями.
+    Комиссия — sale_commission (уже отрицательная в ответе). Логистика — это
+    ОСТАТОК (amount - accruals_for_sale - sale_commission), а не только
+    services[]/delivery_charge: проверено на реальных данных, что часть
+    операций (например, "Услуги доставки Партнерами Ozon на схеме realFBS")
+    несёт всю свою стоимость прямо в "amount", с ПУСТЫМИ services[] и
+    delivery_charge=0 — при подсчёте только по services[]/delivery_charge
+    терялось ~95% реальной логистики (49 620₽ вместо 972 201₽ за проверенный
+    месяц). Остаток — тот же метод, что уже сверен построчно с кабинетом Ozon
+    в build_ozon_finance_waterfall.
 
     Рекламные операции (AD_PROMOTION_OPERATION_TYPES) исключены полностью:
     несмотря на название "по отправлению", у Ozon клики/продвижение бренда
@@ -218,13 +220,16 @@ def aggregate_ozon_finance_by_posting(transactions: list[dict]) -> pd.DataFrame:
             continue
         if op.get("operation_type") in AD_PROMOTION_OPERATION_TYPES:
             continue
-        commission = -(op.get("sale_commission") or 0)
-        services_cost = -sum(s.get("price", 0) for s in (op.get("services") or []))
-        delivery_cost = -((op.get("delivery_charge") or 0) + (op.get("return_delivery_charge") or 0))
+        accruals = float(op.get("accruals_for_sale") or 0)
+        raw_commission = float(op.get("sale_commission") or 0)
+        commission = -raw_commission
+        # residual положительный = реальный расход (услуги/логистика), знак Ozon инвертирован,
+        # так же, как commission/services_cost/delivery_cost выше — по этой же причине минус.
+        residual_cost = -(float(op.get("amount") or 0) - accruals - raw_commission)
 
         entry = totals.setdefault(posting_number, {"Комиссия_реальная": 0.0, "Логистика_реальная": 0.0})
         entry["Комиссия_реальная"] += commission
-        entry["Логистика_реальная"] += services_cost + delivery_cost
+        entry["Логистика_реальная"] += residual_cost
 
     if not totals:
         return pd.DataFrame(columns=["Отправление", "Комиссия_реальная", "Логистика_реальная"])
@@ -491,6 +496,13 @@ def calculate_unit_economics(
     Складывается из:
       Выручка - Себестоимость - Комиссия МП - Логистика - Реклама (ДРР на ед.)
 
+    Только по ДОСТАВЛЕННЫМ заказам — так же, как Ozon считает "Продажи" в
+    своём отчёте (см. build_ozon_finance_waterfall). Заказы "В пути" сюда не
+    входят: у Ozon по ним ещё нет реальных начислений (комиссия/логистика
+    появляются только при доставке), а заказ ещё может быть отменён — включать
+    их значило бы смешивать подтверждённую прибыль с ещё не наступившей. Они
+    отдельно видны в таблице "Доставлено vs В пути" (build_status_cost_breakdown).
+
     Комиссия и логистика берутся из реального финансового отчёта Ozon
     (ozon_finance_by_posting, см. aggregate_ozon_finance_by_posting), если он
     передан — построчно, с распределением суммы отправления между товарами
@@ -498,7 +510,7 @@ def calculate_unit_economics(
     совпадения (WB, ещё не сведённые Ozon-отправления, mock-данные) — плоская
     оценка по ставкам из mock_data (COMMISSION_RATES/LOGISTICS_*).
     """
-    sales = orders[orders["Статус"] != "Отменён"].reset_index(drop=True).copy()
+    sales = orders[orders["Статус"] == "Доставлен"].reset_index(drop=True).copy()
 
     flat_commission = sales.apply(
         lambda r: r["Сумма"] * COMMISSION_RATES.get(r["Маркетплейс"], 0.18), axis=1
@@ -549,13 +561,15 @@ def calculate_unit_economics(
     per_sku["Цена (1 шт)"] = (per_sku["Выручка"] / per_sku["Продано (шт)"]).round(2)
     per_sku = per_sku.rename(columns={"Себестоимость": "Себестоимость (1 шт)"})
 
-    ad_by_mp = ads.groupby("Маркетплейс", as_index=False).agg(
-        **{"Расходы_на_рекламу": ("Расходы_на_рекламу", "sum"), "Выручка_с_рекламы": ("Выручка_с_рекламы", "sum")}
-    )
-    ad_by_mp["ДРР_доля"] = (
-        ad_by_mp["Расходы_на_рекламу"] / ad_by_mp["Выручка_с_рекламы"].replace(0, pd.NA)
-    ).fillna(0.0)
-    drr_map = dict(zip(ad_by_mp["Маркетплейс"], ad_by_mp["ДРР_доля"]))
+    # Делим реальный расход на рекламу пропорционально ВЫРУЧКЕ, а не по
+    # "Выручка_с_рекламы" из Performance API — та учитывает только заказы,
+    # которые сама Ozon-статистика атрибутировала рекламе, и обычно меньше
+    # общей выручки. Деление на неё завышало бы сумму (проверено: 1 427 663₽
+    # разнесённой рекламы против 1 114 712₽ реального расхода). Так сумма
+    # "Реклама (ДРР)" по всем артикулам всегда точно равна реальному расходу.
+    ad_spend_by_mp = ads.groupby("Маркетплейс")["Расходы_на_рекламу"].sum()
+    revenue_by_mp = per_sku.groupby("Маркетплейс")["Выручка"].sum()
+    drr_map = (ad_spend_by_mp / revenue_by_mp.replace(0, pd.NA)).fillna(0.0).to_dict()
 
     per_sku["Реклама (ДРР)"] = per_sku.apply(
         lambda r: r["Выручка"] * drr_map.get(r["Маркетплейс"], 0.0), axis=1
