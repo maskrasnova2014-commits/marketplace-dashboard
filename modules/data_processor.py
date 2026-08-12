@@ -413,6 +413,36 @@ def merge_cost_data(orders: pd.DataFrame, cost_df: pd.DataFrame) -> pd.DataFrame
     return orders.merge(cost_df[["Артикул", "Себестоимость"]], on="Артикул", how="left")
 
 
+def build_status_cost_breakdown(orders: pd.DataFrame, cost_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Разбивка выручки и себестоимости по статусу: "Доставлен" (деньги уже
+    подтверждены) отдельно от "В пути" (заказ ещё может быть отменён/возвращён
+    до фактической доставки — считать эту выручку окончательной прибылью рано).
+    Отменённые заказы не входят.
+    """
+    sales = orders[orders["Статус"] != "Отменён"].copy()
+    merged = sales.merge(cost_df[["Артикул", "Себестоимость"]], on="Артикул", how="left")
+    merged["Себестоимость_найдена"] = merged["Себестоимость"].notna()
+    merged["Себестоимость"] = merged["Себестоимость"].fillna(0.0)
+    merged["Себестоимость (итого)"] = merged["Себестоимость"] * merged["Количество"]
+
+    result = (
+        merged.groupby("Статус", as_index=False)
+        .agg(
+            **{
+                "Количество (шт)": ("Количество", "sum"),
+                "Выручка": ("Сумма", "sum"),
+                "Себестоимость (итого)": ("Себестоимость (итого)", "sum"),
+                "Без себестоимости (шт)": ("Себестоимость_найдена", lambda s: int((~s).sum())),
+            }
+        )
+    )
+    result["Валовая прибыль"] = result["Выручка"] - result["Себестоимость (итого)"]
+    result["Валовая маржа (%)"] = (result["Валовая прибыль"] / result["Выручка"].replace(0, pd.NA) * 100).round(1)
+    status_order = {"Доставлен": 0, "В пути": 1}
+    return result.sort_values(by="Статус", key=lambda s: s.map(status_order).fillna(99))
+
+
 def calculate_unit_economics(
     orders: pd.DataFrame,
     cost_df: pd.DataFrame,
@@ -477,6 +507,7 @@ def calculate_unit_economics(
         )
     )
     per_sku = per_sku.merge(cost_df[["Артикул", "Себестоимость"]], on="Артикул", how="left")
+    per_sku["Себестоимость_найдена"] = per_sku["Себестоимость"].notna()
     per_sku["Себестоимость"] = per_sku["Себестоимость"].fillna(0.0)
     per_sku["Себестоимость (итого)"] = per_sku["Себестоимость"] * per_sku["Продано (шт)"]
 

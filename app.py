@@ -627,14 +627,50 @@ if ozon_finance_by_posting is not None:
     )
 else:
     st.caption("⚠️ Комиссия и логистика — оценка по средним ставкам (нет данных Ozon Finance API).")
+
+st.markdown("**Доставлено vs В пути** — выручка «В пути» ещё не окончательна: заказ может быть отменён/возвращён.")
+status_breakdown = dp.build_status_cost_breakdown(orders, cost_df)
+st.dataframe(
+    with_money_columns(status_breakdown, ["Выручка", "Себестоимость (итого)", "Валовая прибыль"]),
+    use_container_width=True,
+    hide_index=True,
+)
+
 unit_econ = dp.calculate_unit_economics(orders, cost_df, ads, ozon_finance_by_posting)
+
+missing_cost = unit_econ[~unit_econ["Себестоимость_найдена"]]
+if not missing_cost.empty:
+    missing_qty = int(missing_cost["Продано (шт)"].sum())
+    missing_revenue = missing_cost["Выручка"].sum()
+    st.warning(
+        f"⚠️ Себестоимость не найдена для {len(missing_cost)} артикулов ({missing_qty} шт, "
+        f"{format_money(missing_revenue)} выручки) — по ним прибыль в таблице ниже завышена (посчитана как если "
+        f"бы себестоимость = 0). Артикулы: {', '.join(missing_cost['Артикул'].tolist())}"
+    )
+
+loss_making = unit_econ[unit_econ["Чистая прибыль"] < 0]
+if not loss_making.empty:
+    loss_qty = int(loss_making["Продано (шт)"].sum())
+    loss_total = loss_making["Чистая прибыль"].sum()
+    st.error(
+        f"🚨 Продажа в минус: {len(loss_making)} артикулов ({loss_qty} шт) дают отрицательную чистую прибыль, "
+        f"суммарно {format_money(loss_total)}."
+    )
+    st.dataframe(
+        with_money_columns(
+            loss_making[["Артикул", "Категория", "Селлер", "Маркетплейс", "Продано (шт)", "Выручка", "Чистая прибыль", "Маржинальность (%)"]],
+            ["Выручка", "Чистая прибыль"],
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 total_profit = unit_econ["Чистая прибыль"].sum()
 total_revenue = unit_econ["Выручка"].sum()
 
 st.dataframe(
     with_money_columns(
-        unit_econ,
+        unit_econ.drop(columns=["Себестоимость_найдена"]),
         [
             "Выручка",
             "Себестоимость",
