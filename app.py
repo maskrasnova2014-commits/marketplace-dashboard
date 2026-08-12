@@ -265,11 +265,12 @@ def fetch_ozon_finance(client_id: str, api_key: str, seller_label: str, date_fro
     )
 
 
-def load_orders(date_from: date, date_to: date) -> tuple[pd.DataFrame, bool]:
+def load_orders(date_from: date, date_to: date) -> tuple[pd.DataFrame, str]:
     """
     Собирает заказы со всех настроенных кабинетов Ozon + WB. Если ключи не
     заданы или запрос не удался — безопасно переключается на mock_data.py.
-    Возвращает (df, использованы_ли_моки).
+    Возвращает (df, статус), где статус — "real" (всё по API), "partial"
+    (часть по API, часть тестовые) или "mock" (полностью тестовые).
     """
     frames = []
     used_mock = False
@@ -308,14 +309,15 @@ def load_orders(date_from: date, date_to: date) -> tuple[pd.DataFrame, bool]:
         real_df = pd.DataFrame()
 
     if real_df.empty:
-        return load_mock_orders(date_from, date_to), True
+        return load_mock_orders(date_from, date_to), "mock"
 
     if used_mock:
         # Часть источников недоступна — дополняем мок-данными для полноты картины,
         # но помечаем это явно пользователю.
         st.info("Часть данных получена по API, часть — тестовые (нет ключей/ошибка для одного из источников).")
+        return real_df, "partial"
 
-    return real_df, used_mock
+    return real_df, "real"
 
 
 def load_ads(date_from: date, date_to: date) -> pd.DataFrame:
@@ -485,7 +487,7 @@ with st.sidebar:
 # --------------------------------------------------------------------------
 # Загрузка данных
 # --------------------------------------------------------------------------
-orders_raw, is_mock = load_orders(st.session_state.date_from, st.session_state.date_to)
+orders_raw, orders_source = load_orders(st.session_state.date_from, st.session_state.date_to)
 ads_raw = load_ads(st.session_state.date_from, st.session_state.date_to)
 ozon_finance_transactions = load_ozon_finance_transactions(st.session_state.date_from, st.session_state.date_to)
 ozon_finance_by_posting = (
@@ -532,8 +534,10 @@ def with_money_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
 # Заголовок
 # --------------------------------------------------------------------------
 st.title("📊 Аналитика маркетплейсов — Мебель")
-if is_mock:
-    st.caption("⚠️ Показаны тестовые (mock) данные — введите API-ключи в сайдбаре для реальных данных.")
+if orders_source == "mock":
+    st.caption("⚠️ Показаны полностью тестовые (mock) данные — введите API-ключи в сайдбаре для реальных данных.")
+elif orders_source == "partial":
+    st.caption("ℹ️ Заказы получены по API частично — по одному из источников (см. предупреждение выше) используются тестовые данные.")
 
 if orders.empty:
     st.warning("Нет данных за выбранный период/фильтры.")
