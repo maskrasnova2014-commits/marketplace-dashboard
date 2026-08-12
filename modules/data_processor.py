@@ -101,20 +101,28 @@ def transform_wb_sales(sales: list[dict], seller_label: str) -> pd.DataFrame:
     return df
 
 
+def _parse_ozon_money(value) -> float:
+    """Ozon Performance API отдаёт суммы строкой с запятой как разделителем ('185,59')."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    return float(str(value).replace(",", ".").replace(" ", "") or 0)
+
+
 def transform_ozon_ads(daily_stats: list[dict], seller_label: str) -> pd.DataFrame:
     """
     Приводит статистику Ozon Performance API к внутренней схеме рекламы.
 
-    Поле расходов ("Расходы_на_рекламу") — надёжная часть ответа. Поля
-    заказов/выручки с рекламы зависят от версии кабинета и могут
-    отсутствовать в ответе — тогда они останутся нулевыми и ДРР по этому
-    источнику будет недоступен (не будет ошибочно нарисован из воздуха).
+    Проверено на реальном ответе /api/client/statistics/daily/json: поля
+    'moneySpent', 'orders', 'ordersMoney', 'date' — на уровне отдельных
+    кампаний/товаров за день. Суммы приходят строкой с запятой (напр. "185,59").
     """
     rows = []
     for row in daily_stats:
-        spend = float(row.get("moneySpent") or row.get("spend") or row.get("sum") or 0)
-        orders = int(row.get("orders") or row.get("ordersCount") or 0)
-        revenue = float(row.get("ordersMoney") or row.get("revenue") or 0)
+        spend = _parse_ozon_money(row.get("moneySpent") or row.get("spend") or row.get("sum"))
+        orders = int(float(row.get("orders") or row.get("ordersCount") or 0))
+        revenue = _parse_ozon_money(row.get("ordersMoney") or row.get("revenue"))
         row_date = row.get("date") or row.get("day")
         rows.append(
             {
