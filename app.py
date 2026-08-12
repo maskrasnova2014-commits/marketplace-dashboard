@@ -469,6 +469,22 @@ ads = ads_raw[ads_raw["Маркетплейс"].isin(selected_marketplaces)]
 
 cost_df = st.session_state.cost_df if st.session_state.cost_df is not None else mock_data.generate_cost_reference()
 
+def format_money(value) -> str:
+    """Денежный формат: округление только дробной части, разряды через пробел, ₽."""
+    if pd.isna(value):
+        return "—"
+    return f"{value:,.0f} ₽".replace(",", " ")
+
+
+def with_money_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    """Копия df с указанными колонками, отформатированными как деньги (только для отображения)."""
+    display_df = df.copy()
+    for col in columns:
+        if col in display_df.columns:
+            display_df[col] = display_df[col].apply(format_money)
+    return display_df
+
+
 # --------------------------------------------------------------------------
 # Заголовок
 # --------------------------------------------------------------------------
@@ -493,7 +509,7 @@ c4.metric("% Отмен (по сумме / шт)", f"{kpis['cancel_rate_sum']:.1
 c5.metric("Средний чек (AOV)", f"{kpis['aov']:,.0f} ₽".replace(",", " "))
 
 with st.expander("Причины отмен"):
-    st.dataframe(kpis["cancel_reasons"], use_container_width=True, hide_index=True)
+    st.dataframe(with_money_columns(kpis["cancel_reasons"], ["Сумма"]), use_container_width=True, hide_index=True)
 
 st.divider()
 
@@ -502,7 +518,11 @@ st.divider()
 # --------------------------------------------------------------------------
 st.subheader("📈 Сводная динамика по селлерам и месяцам")
 dynamics = dp.build_dynamics_table(orders)
-st.dataframe(dynamics, use_container_width=True, hide_index=True)
+st.dataframe(
+    with_money_columns(dynamics, ["Принято (руб)", "Доставлено (руб)", "Отменено (руб)"]),
+    use_container_width=True,
+    hide_index=True,
+)
 
 st.divider()
 
@@ -514,7 +534,7 @@ categories = dp.category_breakdown(orders)
 
 col_table, col_pie, col_bar = st.columns([1.2, 1, 1])
 with col_table:
-    st.dataframe(categories, use_container_width=True, hide_index=True)
+    st.dataframe(with_money_columns(categories, ["Сумма (руб)"]), use_container_width=True, hide_index=True)
 with col_pie:
     fig_pie = px.pie(categories, names="Категория", values="Сумма (руб)", title="Доля выручки по категориям")
     st.plotly_chart(fig_pie, use_container_width=True)
@@ -529,7 +549,11 @@ st.divider()
 # --------------------------------------------------------------------------
 st.subheader("📣 Реклама и ДРР")
 ad_summary = dp.advertising_summary(ads, group_by=["Маркетплейс"])
-st.dataframe(ad_summary, use_container_width=True, hide_index=True)
+st.dataframe(
+    with_money_columns(ad_summary, ["Расходы на рекламу", "Выручка с рекламы"]),
+    use_container_width=True,
+    hide_index=True,
+)
 
 st.divider()
 
@@ -538,10 +562,26 @@ st.divider()
 # --------------------------------------------------------------------------
 st.subheader("💰 Юнит-экономика (от выручки к чистой прибыли)")
 unit_econ = dp.calculate_unit_economics(orders, cost_df, ads)
-st.dataframe(unit_econ, use_container_width=True, hide_index=True)
 
 total_profit = unit_econ["Чистая прибыль"].sum()
 total_revenue = unit_econ["Выручка"].sum()
+
+st.dataframe(
+    with_money_columns(
+        unit_econ,
+        [
+            "Выручка",
+            "Себестоимость",
+            "Себестоимость (итого)",
+            "Комиссия МП",
+            "Логистика",
+            "Реклама (ДРР)",
+            "Чистая прибыль",
+        ],
+    ),
+    use_container_width=True,
+    hide_index=True,
+)
 avg_margin = (total_profit / total_revenue * 100) if total_revenue else 0
 mc1, mc2 = st.columns(2)
 mc1.metric("Чистая прибыль (итого)", f"{total_profit:,.0f} ₽".replace(",", " "))
