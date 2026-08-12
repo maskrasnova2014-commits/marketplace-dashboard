@@ -61,35 +61,55 @@ class OzonClient:
             raise OzonAPIError(f"Сетевая ошибка при запросе к Ozon: {exc}") from exc
 
     def get_fbo_postings(self, date_from: date, date_to: date) -> list[dict[str, Any]]:
-        """Список отправлений FBO за период."""
-        payload = {
-            "dir": "ASC",
-            "filter": {
-                "since": f"{date_from.isoformat()}T00:00:00.000Z",
-                "to": f"{date_to.isoformat()}T23:59:59.999Z",
-            },
-            "limit": 1000,
-            "offset": 0,
-            "translit": True,
-            "with": {"analytics_data": True, "financial_data": True},
-        }
-        data = self._post("/v2/posting/fbo/list", payload)
-        return data.get("result", [])
+        """Список отправлений FBO за период. Пагинируется — без этого молча обрезалось бы на 1000."""
+        postings: list[dict[str, Any]] = []
+        offset = 0
+        limit = 1000
+        while True:
+            payload = {
+                "dir": "ASC",
+                "filter": {
+                    "since": f"{date_from.isoformat()}T00:00:00.000Z",
+                    "to": f"{date_to.isoformat()}T23:59:59.999Z",
+                },
+                "limit": limit,
+                "offset": offset,
+                "translit": True,
+                "with": {"analytics_data": True, "financial_data": True},
+            }
+            data = self._post("/v2/posting/fbo/list", payload)
+            batch = data.get("result", [])
+            postings.extend(batch)
+            if len(batch) < limit:
+                break
+            offset += limit
+        return postings
 
     def get_fbs_postings(self, date_from: date, date_to: date) -> list[dict[str, Any]]:
-        """Список отправлений FBS за период."""
-        payload = {
-            "dir": "ASC",
-            "filter": {
-                "since": f"{date_from.isoformat()}T00:00:00.000Z",
-                "to": f"{date_to.isoformat()}T23:59:59.999Z",
-            },
-            "limit": 1000,
-            "offset": 0,
-            "with": {"analytics_data": True, "financial_data": True},
-        }
-        data = self._post("/v3/posting/fbs/list", payload)
-        return data.get("result", {}).get("postings", [])
+        """Список отправлений FBS за период. Пагинируется — без этого молча обрезалось бы на 1000."""
+        postings: list[dict[str, Any]] = []
+        offset = 0
+        limit = 1000
+        while True:
+            payload = {
+                "dir": "ASC",
+                "filter": {
+                    "since": f"{date_from.isoformat()}T00:00:00.000Z",
+                    "to": f"{date_to.isoformat()}T23:59:59.999Z",
+                },
+                "limit": limit,
+                "offset": offset,
+                "with": {"analytics_data": True, "financial_data": True},
+            }
+            data = self._post("/v3/posting/fbs/list", payload)
+            result = data.get("result", {})
+            batch = result.get("postings", [])
+            postings.extend(batch)
+            has_next = result.get("has_next")
+            if has_next is False or (has_next is None and len(batch) < limit):
+                break
+            offset += limit
+        return postings
 
     def _get_finance_transactions_chunk(self, date_from: date, date_to: date) -> list[dict[str, Any]]:
         """Пагинированный запрос за период не длиннее месяца (см. get_finance_transactions)."""

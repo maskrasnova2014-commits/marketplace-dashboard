@@ -22,6 +22,23 @@ OZON_STATUS_MAP = {
 
 FURNITURE_CATEGORIES = ["Стулья полубарные", "Стулья барные", "Стулья", "Столы", "Диваны"]
 
+# Операции Ozon, относящиеся к рекламе/продвижению через ОСНОВНОЙ кабинет
+# (не Performance API). Реальный расход по ним уже учитывается отдельно
+# через Performance API ("Реклама (ДРР)" в юнит-экономике) — их нужно
+# исключать из "Логистика_реальная" в aggregate_ozon_finance_by_posting,
+# иначе реклама вычитается дважды. Проверено на реальных данных: у всех
+# операций этого списка sale_commission и accruals_for_sale всегда равны 0,
+# то есть их можно полностью пропускать без потери комиссии.
+AD_PROMOTION_OPERATION_TYPES = {
+    "OperationMarketplaceCostPerClick",
+    "MarketplaceServiceBrandCommission",
+    "OperationPromotionWithCostPerOrder",
+    "OperationSubscriptionPremiumPlus",
+    "OperationLabelOriginal",
+    "OperationLabelBrandVerified",
+    "OperationMarketplaceAcceleratedProductReviews",
+}
+
 
 def infer_furniture_category(text: str) -> str:
     """
@@ -185,11 +202,21 @@ def aggregate_ozon_finance_by_posting(transactions: list[dict]) -> pd.DataFrame:
     Суммируется по всем операциям за период для каждого отправления —
     комиссия и разные логистические начисления по одному заказу могут
     приходить отдельными операциями.
+
+    Рекламные операции (AD_PROMOTION_OPERATION_TYPES) исключены полностью:
+    несмотря на название "по отправлению", у Ozon клики/продвижение бренда
+    почти всегда привязаны к конкретному posting_number (проверено: 17514
+    из 17610 таких операций за 90 дней). Если их не исключить, реклама
+    задваивается — один раз здесь как "Логистика", второй раз в юнит-
+    экономике как "Реклама (ДРР)" из Performance API. У этих операций
+    sale_commission/accruals_for_sale всегда 0, так что пропуск безопасен.
     """
     totals: dict[str, dict[str, float]] = {}
     for op in transactions:
         posting_number = (op.get("posting") or {}).get("posting_number")
         if not posting_number:
+            continue
+        if op.get("operation_type") in AD_PROMOTION_OPERATION_TYPES:
             continue
         commission = -(op.get("sale_commission") or 0)
         services_cost = -sum(s.get("price", 0) for s in (op.get("services") or []))
@@ -219,15 +246,6 @@ def aggregate_ozon_finance_by_posting(transactions: list[dict]) -> pd.DataFrame:
 # "Логистика и прочие услуги", т.к. Ozon не публикует точное правило их
 # разделения — сумма этой объединённой строки сверена и совпадает с точностью
 # до рублей (расхождение ~40₽ на 972 000₽, статистическая погрешность).
-AD_PROMOTION_OPERATION_TYPES = {
-    "OperationMarketplaceCostPerClick",
-    "MarketplaceServiceBrandCommission",
-    "OperationPromotionWithCostPerOrder",
-    "OperationSubscriptionPremiumPlus",
-    "OperationLabelOriginal",
-    "OperationLabelBrandVerified",
-    "OperationMarketplaceAcceleratedProductReviews",
-}
 OTHER_INCOME_TRANSACTION_TYPES = {"transfer_delivery", "compensation"}
 
 
