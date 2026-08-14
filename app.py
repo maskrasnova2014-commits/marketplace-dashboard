@@ -750,9 +750,12 @@ else:
         st.warning(f"Не удалось получить остатки по кабинету «{selected_label}» — см. предупреждение выше.")
     else:
         stocks_df = dp.transform_ozon_stocks(stock_items)
-        seller_orders = orders_raw[orders_raw["Селлер"] == selected_label]
+        # Остатки — с одного выбранного кабинета (это физический склад), но
+        # скорость продаж считаем по ВСЕМ кабинетам Ozon сразу — один и тот же
+        # товар может продаваться сразу с нескольких аккаунтов с общего остатка.
+        all_ozon_orders = orders_raw[orders_raw["Маркетплейс"] == "Ozon"]
         forecast = dp.build_production_forecast(
-            stocks_df, seller_orders,
+            stocks_df, all_ozon_orders,
             weeks_lookback=8, production_weeks=production_weeks, order_cycle_weeks=order_cycle_weeks,
         )
 
@@ -766,6 +769,8 @@ else:
         st.caption(
             "«К заказу» — сколько нужно произвести сейчас, чтобы хватило на весь цикл "
             f"(производство {production_weeks:g} нед. + до следующего заказа {order_cycle_weeks:g} нед.). "
-            "Скорость продаж — среднее за последние 8 недель по доставленным заказам."
+            "Остатки — с кабинета «" + selected_label + "» (физический склад). Скорость продаж — среднее за "
+            "последние 8 недель по доставленным заказам **со всех кабинетов Ozon сразу** (общий остаток "
+            "продаётся с нескольких аккаунтов)."
         )
         st.dataframe(forecast, use_container_width=True, hide_index=True)
