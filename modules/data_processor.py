@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from modules.mock_data import COMMISSION_RATES, LOGISTICS_LAST_MILE, LOGISTICS_MAGISTRAL
@@ -188,6 +189,90 @@ def transform_wb_ads(advert_costs: list[dict], seller_label: str) -> pd.DataFram
         df = df.dropna(subset=["Дата"])
         df["Месяц"] = df["Дата"].dt.to_period("M").astype(str)
     return df
+
+
+def transform_ozon_stocks(items: list[dict]) -> pd.DataFrame:
+    """Приводит остатки Ozon (/v4/product/info/stocks) к плоской таблице по артикулу."""
+    rows = []
+    for item in items:
+        stocks = item.get("stocks", [])
+        present_total = sum(s.get("present", 0) for s in stocks)
+        reserved_total = sum(s.get("reserved", 0) for s in stocks)
+        rows.append(
+            {
+                "Артикул": item.get("offer_id", "N/A"),
+                "Остаток (всего)": present_total,
+                "Резерв": reserved_total,
+                "Доступно": present_total - reserved_total,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_production_forecast(
+    stocks: pd.DataFrame,
+    orders: pd.DataFrame,
+    weeks_lookback: int = 8,
+    production_weeks: float = 2,
+    order_cycle_weeks: float = 1,
+) -> pd.DataFrame:
+    """
+    Прогноз заказа в производство по каждому артикулу.
+
+    Логика: цикл производства — production_weeks недель, заказ делается раз в
+    order_cycle_weeks недель. Партия, заказанная сегодня, доедет только через
+    production_weeks недель — а следующая возможность доказать нехватку
+    появится только через order_cycle_weeks после этого. Поэтому запаса на
+    складе должно хватать на весь цикл (production_weeks + order_cycle_weeks),
+    иначе перед следующей поставкой возникнет дефицит.
+
+    Скорость продаж — среднее количество проданных (доставленных) штук в
+    неделю за последние weeks_lookback недель, по фактическим заказам.
+    """
+    columns = [
+        "Артикул", "Остаток (всего)", "Резерв", "Доступно",
+        "Продажи/нед", "Хватит на (нед)", "К заказу (шт)", "Статус",
+    ]
+    if stocks.empty:
+        return pd.DataFrame(columns=columns)
+
+    cutoff = pd.Timestamp.now() - pd.Timedelta(weeks=weeks_lookback)
+    recent_sales = orders[(orders["Статус"] == "Доставлен") & (orders["Дата"] >= cutoff)]
+    weekly_sales = (
+        recent_sales.groupby("Артикул")["Количество"].sum() / weeks_lookback
+    ).reset_index().rename(columns={"Количество": "Продажи/нед"})
+
+    forecast = stocks.merge(weekly_sales, on="Артикул", how="left")
+    forecast["Продажи/нед"] = forecast["Продажи/нед"].fillna(0.0).round(1)
+
+    cycle_weeks = production_weeks + order_cycle_weeks
+    sales_per_week = forecast["Продажи/нед"].to_numpy(dtype=float)
+    available = forecast["Доступно"].to_numpy(dtype=float)
+    weeks_left = np.divide(
+        available, sales_per_week, out=np.full_like(available, np.nan), where=sales_per_week > 0
+    )
+    forecast["Хватит на (нед)"] = pd.Series(weeks_left, index=forecast.index).round(1)
+    forecast["К заказу (шт)"] = (
+        (forecast["Продажи/нед"] * cycle_weeks - forecast["Доступно"]).clip(lower=0)
+    ).round(0).astype(int)
+
+    def _status(row: pd.Series) -> str:
+        weeks_left = row["Хватит на (нед)"]
+        if row["Продажи/нед"] == 0 or pd.isna(weeks_left):
+            return "⚪ Нет продаж"
+        if weeks_left < production_weeks:
+            return "🔴 Срочно"
+        if weeks_left < cycle_weeks:
+            return "🟡 Пора заказывать"
+        return "🟢 Достаточно"
+
+    forecast["Статус"] = forecast.apply(_status, axis=1)
+
+    priority = {"🔴": 0, "🟡": 1, "🟢": 2, "⚪": 3}
+    forecast["_priority"] = forecast["Статус"].str[0].map(priority).fillna(9)
+    forecast = forecast.sort_values(["_priority", "Хватит на (нед)"]).drop(columns="_priority")
+
+    return forecast[columns]
 
 
 def aggregate_ozon_finance_by_posting(transactions: list[dict]) -> pd.DataFrame:

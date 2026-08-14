@@ -179,6 +179,13 @@ def _fetch_ozon_finance_raw(client_id: str, api_key: str, date_from: date, date_
     return client.get_finance_transactions(date_from, date_to)
 
 
+@st.cache_data(ttl=1800, show_spinner="Загрузка остатков Ozon...")
+def _fetch_ozon_stocks_raw(client_id: str, api_key: str):
+    """Сырые остатки по товарам Ozon (для прогноза заказа в производство)."""
+    client = OzonClient(client_id, api_key)
+    return client.get_stocks()
+
+
 def _fetch_with_cooldown(source_key: str, fetch_fn, error_types, label: str):
     """
     Тонкая (не кэшируемая) обвязка: ловит ошибки API и не даёт им "залипать"
@@ -262,6 +269,15 @@ def fetch_ozon_finance(client_id: str, api_key: str, seller_label: str, date_fro
         lambda: _fetch_ozon_finance_raw(client_id, api_key, date_from, date_to),
         OzonAPIError,
         f"Ozon Finance ({seller_label})",
+    )
+
+
+def fetch_ozon_stocks(client_id: str, api_key: str, seller_label: str):
+    return _fetch_with_cooldown(
+        f"ozon_stocks_{client_id}",
+        lambda: _fetch_ozon_stocks_raw(client_id, api_key),
+        OzonAPIError,
+        f"Ozon Остатки ({seller_label})",
     )
 
 
@@ -702,3 +718,54 @@ avg_margin = (total_profit / total_revenue * 100) if total_revenue else 0
 mc1, mc2 = st.columns(2)
 mc1.metric("Чистая прибыль (итого)", f"{total_profit:,.0f} ₽".replace(",", " "))
 mc2.metric("Средняя маржинальность", f"{avg_margin:.1f}%")
+
+st.divider()
+
+# --------------------------------------------------------------------------
+# 7. Остатки и прогноз заказа в производство
+# --------------------------------------------------------------------------
+st.subheader("📦 Остатки и прогноз заказа в производство")
+
+ozon_accounts_with_creds = [a for a in st.session_state.ozon_accounts if a["client_id"] and a["api_key"]]
+
+if not ozon_accounts_with_creds:
+    st.info("Добавь Client-Id и Api-Key хотя бы одного кабинета Ozon в сайдбаре, чтобы увидеть остатки.")
+else:
+    account_labels = [a["seller_label"] or "Ozon-кабинет" for a in ozon_accounts_with_creds]
+    default_idx = next(
+        (i for i, label in enumerate(account_labels) if "лебедев" in label.lower()), 0
+    )
+    stock_col1, stock_col2, stock_col3 = st.columns([2, 1, 1])
+    with stock_col1:
+        selected_label = st.selectbox("Кабинет Ozon (только один источник остатков)", account_labels, index=default_idx)
+    with stock_col2:
+        production_weeks = st.number_input("Цикл производства, нед.", min_value=0.5, value=2.0, step=0.5)
+    with stock_col3:
+        order_cycle_weeks = st.number_input("Заказ каждые, нед.", min_value=0.5, value=1.0, step=0.5)
+
+    selected_account = ozon_accounts_with_creds[account_labels.index(selected_label)]
+    stock_items = fetch_ozon_stocks(selected_account["client_id"], selected_account["api_key"], selected_label)
+
+    if stock_items is None:
+        st.warning(f"Не удалось получить остатки по кабинету «{selected_label}» — см. предупреждение выше.")
+    else:
+        stocks_df = dp.transform_ozon_stocks(stock_items)
+        seller_orders = orders_raw[orders_raw["Селлер"] == selected_label]
+        forecast = dp.build_production_forecast(
+            stocks_df, seller_orders,
+            weeks_lookback=8, production_weeks=production_weeks, order_cycle_weeks=order_cycle_weeks,
+        )
+
+        urgent = forecast[forecast["Статус"] == "🔴 Срочно"]
+        soon = forecast[forecast["Статус"] == "🟡 Пора заказывать"]
+        fc1, fc2, fc3 = st.columns(3)
+        fc1.metric("🔴 Срочно заказать", len(urgent))
+        fc2.metric("🟡 Пора заказывать", len(soon))
+        fc3.metric("Всего SKU на складе", len(forecast))
+
+        st.caption(
+            "«К заказу» — сколько нужно произвести сейчас, чтобы хватило на весь цикл "
+            f"(производство {production_weeks:g} нед. + до следующего заказа {order_cycle_weeks:g} нед.). "
+            "Скорость продаж — среднее за последние 8 недель по доставленным заказам."
+        )
+        st.dataframe(forecast, use_container_width=True, hide_index=True)

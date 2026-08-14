@@ -9,6 +9,7 @@
                                          (используется вместо /v1/finance/realization,
                                          который на практике возвращает 404 — видимо,
                                          устарел в текущей версии API)
+- POST /v4/product/info/stocks        — остатки товаров (FBO/FBS/RFBS) по артикулу
 
 Документация: https://docs.ozon.ru/api/seller/
 """
@@ -155,3 +156,21 @@ class OzonClient:
             operations.extend(self._get_finance_transactions_chunk(chunk_start, chunk_end))
             chunk_start = chunk_end + timedelta(days=1)
         return operations
+
+    def get_stocks(self) -> list[dict[str, Any]]:
+        """
+        Остатки по всем товарам (FBO/FBS/RFBS), с пагинацией по курсору.
+        Каждый элемент: {"offer_id", "product_id", "stocks": [{"type": "fbo"|"fbs"|"rfbs", "present", "reserved", ...}]}.
+        """
+        items: list[dict[str, Any]] = []
+        cursor = ""
+        limit = 200
+        while True:
+            payload = {"cursor": cursor, "filter": {"visibility": "ALL"}, "limit": limit}
+            data = self._post("/v4/product/info/stocks", payload)
+            batch = data.get("items", [])
+            items.extend(batch)
+            cursor = data.get("cursor", "")
+            if not batch or not cursor:
+                break
+        return items
